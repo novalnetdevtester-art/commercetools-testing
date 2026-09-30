@@ -114,7 +114,6 @@ async function findReference(payment: Payment, kind: Modification, action: Actio
   );
   requireValue(original?.interactionId, "Original payment transaction not found.");
 
-  // The settlement Charge created by the existing webhook uses '<pspReference>-Charge'.
   const pspReference = original.type === "Charge" && original.interactionId.endsWith("-Charge")
     ? original.interactionId.slice(0, -"-Charge".length)
     : original.interactionId;
@@ -142,7 +141,6 @@ async function callNovalnet(endpoint: string, transaction: object, custom: { sho
       body: JSON.stringify({ transaction, custom }),
     });
     if (!response.ok) throw new Error(`Novalnet HTTP ${response.status}`);
-    // A TID can exceed JS's safe integer range. Preserve it as a string.
     const parsed = JSONbig({ storeAsString: true }).parse(await response.text());
     return JSON.parse(JSON.stringify(parsed)) as NovalnetReply;
   } finally {
@@ -155,7 +153,6 @@ function getOutcome(kind: Modification, reply: NovalnetReply): PaymentModificati
   if (apiStatus === "FAILURE") return PaymentModificationStatus.REJECTED;
   if (apiStatus !== "SUCCESS") return PaymentModificationStatus.RECEIVED;
 
-  // For a refund, the parent transaction may stay CONFIRMED while the new refund is pending.
   const status = String(kind === "refund"
     ? reply.transaction?.refund?.status ?? reply.refund?.status ?? reply.transaction?.status ?? ""
     : reply.transaction?.status ?? "").toUpperCase();
@@ -174,11 +171,9 @@ function getOutcome(kind: Modification, reply: NovalnetReply): PaymentModificati
 function localeOf(payment: Payment, reference: Reference): SupportedLocale {
   const locale = (payment.custom?.fields?.lang ?? payment.custom?.fields?.language) as string | undefined;
   if (locale === "en" || locale === "de") return locale;
-  // Direct and redirect creation do not persist `lang` in their private object.
-  // Their initial transaction comment is already translated, so reuse it.
   const initial = String(reference.original.custom?.fields?.transactionComments ?? "");
   if (initial.includes("Novalnet Transaction ID:")) return "en";
-  return "de"; // Existing webhook defaults to German.
+  return "de";
 }
 
 function commentFor(kind: Modification, payment: Payment, reference: Reference,
@@ -212,8 +207,6 @@ function appendComment(existing: unknown, addition: string): string {
 }
 
 async function syncOrderComment(paymentId: string, pspReference: string): Promise<void> {
-  // This copies the original transaction's comment, matching syncPaymentToOrder in
-  // novalnet-payment.service.ts. Order states are reconciled separately below.
   const payment = (await projectApiRoot.payments().withId({ ID: paymentId }).get().execute()).body;
   const original = [...payment.transactions].reverse().find((tx) => tx.interactionId === pspReference);
   if (!original) return;
@@ -226,7 +219,6 @@ async function syncOrderComment(paymentId: string, pspReference: string): Promis
     return;
   }
   await createOrderPaymentCommentsType();
-  // The Order contains a TypeReference (id/typeId), not the Type's key.
   const commentType = (await projectApiRoot.types()
     .withKey({ key: "order-payment-comments" }).get().execute()).body;
   const comment = String(original.custom?.fields?.transactionComments ?? "");
@@ -254,13 +246,10 @@ async function syncIntentOrderStates(paymentId: string, kind: Modification,
     status: reply.transaction?.status,
     eventType: kind === "capture" ? "TRANSACTION_CAPTURE" :
       kind === "cancel" ? "TRANSACTION_CANCEL" : "TRANSACTION_REFUND",
-    // The Payment Intent capture action is validated as a full capture.
     isPartialCapture: false,
   });
   if (!states) return;
 
-  // Checkout creates the Order before it sends a Payment Intent. Fetch it
-  // after the Payment is saved so this uses the latest Order version.
   const results = await projectApiRoot.orders().get({ queryArgs: {
     where: `paymentInfo(payments(id="${paymentId}"))`, limit: 1,
   } }).execute();
@@ -274,7 +263,6 @@ async function syncIntentOrderStates(paymentId: string, kind: Modification,
   if (order.paymentState !== states.paymentState) {
     actions.push({ action: "changePaymentState", paymentState: states.paymentState });
   }
-  // Fulfillment owns Order.orderState. A capture/refund must not reopen an Order.
   if (actions.length) {
     await projectApiRoot.orders().withId({ ID: order.id }).post({
       body: { version: order.version, actions },
@@ -300,7 +288,6 @@ async function saveCaptureOrCancel(payment: Payment, reference: Reference,
     actions.push({ action: "setTransactionCustomField", transactionId: original.id,
       name: "transactionComments", value: combined });
   }
-  // Preserve the successful authorization as financial history.
   const statusCode = reply.transaction?.status_code ?? reply.result?.status_code;
   if (statusCode != null && latest.paymentStatus?.interfaceCode !== String(statusCode)) {
     actions.push({ action: "setStatusInterfaceCode", interfaceCode: String(statusCode) });
@@ -326,8 +313,6 @@ async function saveCaptureOrCancel(payment: Payment, reference: Reference,
     }
   }
   if (actions.length) await root.post({ body: { version: latest.version, actions } }).execute();
-  // An Order write failure must not turn a completed PSP operation into a
-  // request that appears safe to retry.
   try {
     await syncOrderComment(payment.id, reference.pspReference);
   } catch (error) {
@@ -345,7 +330,7 @@ async function saveRefund(payment: Payment, reference: Reference,
     log.warn("[PAYMENT_INTENT] Refund accepted without refund TID; awaiting reconciliation", {
       paymentId: payment.id, tid: reference.tid,
     });
-    return false; // Never invent a refund ID: the webhook deduplicates by this TID.
+    return false;
   }
   if (refund?.amount != null && Number(refund.amount) !== amount) {
     throw new Error("Novalnet refund amount differs from the requested amount.");
@@ -386,8 +371,6 @@ async function saveRefund(payment: Payment, reference: Reference,
   }
   if (actions.length) await root.post({ body: { version: latest.version, actions } }).execute();
 
-  // Match the fields written by handleTransactionRefund. Preserve the private
-  // data not related to the refund (and the original TID needed for future calls).
   try {
     const refundedAmount = sum(latest, "Refund") + (existing?.state === "Success" ? 0 : amount);
     await customObjectService.upsert("nn-private-data", `${payment.id}-${reference.pspReference}`, {
@@ -450,8 +433,6 @@ export async function executePaymentIntent(
     apiStatus: reply.result?.status, transactionStatus: reply.transaction?.status,
   });
   if (outcome !== PaymentModificationStatus.APPROVED) {
-    // Unknown or pending PSP results must never be recorded as successful CT
-    // transactions. A definitive failure is rejected; pending awaits reconciliation.
     return { outcome, paymentReference: payment.id };
   }
   if (kind === "refund") {
@@ -464,8 +445,6 @@ export async function executePaymentIntent(
   try {
     await syncIntentOrderStates(payment.id, kind, reply);
   } catch (error) {
-    // Novalnet and the Payment have already completed. Returning an error here
-    // could cause the caller to repeat a capture or refund at the PSP.
     log.error("[PAYMENT_INTENT] Payment saved, Order state sync failed", {
       paymentId: payment.id, kind, error,
     });
