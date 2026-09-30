@@ -4,7 +4,7 @@ import {
   statusHandler,
 } from "@commercetools/connect-payments-sdk";
 import { ConfigResponse, StatusResponse } from "./types/operation.type";
-import { Address, Customer } from "@commercetools/platform-sdk";
+import { Address, Customer, OrderUpdateAction } from "@commercetools/platform-sdk";
 import { SupportedPaymentComponentsSchemaDTO } from "../dtos/operations/payment-componets.dto";
 import packageJSON from "../../package.json";
 import { AbstractPaymentService } from "./abstract-payment.service";
@@ -472,20 +472,22 @@ export class NovalnetPaymentService extends AbstractPaymentService {
           canWriteOrderComment = false;
         }
       }
+      const commentActions: OrderUpdateAction[] = [];
+      if (!order.body.custom?.type) {
+        commentActions.push({
+          action: "setCustomType",
+          type: { key: "order-payment-comments", typeId: "type" },
+        });
+      }
+      commentActions.push({
+        action: "setCustomField",
+        name: "paymentComments",
+        value: paymentComment,
+      });
       if (canWriteOrderComment) await projectApiRoot.orders().withId({ ID: orderId }).post({
         body: {
           version: order.body.version,
-          actions: [
-            ...(!order.body.custom?.type ? [{
-              action: "setCustomType",
-              type: { key: "order-payment-comments", typeId: "type" },
-            }] : []),
-            {
-              action: "setCustomField",
-              name: "paymentComments",
-              value: paymentComment,
-            },
-          ],
+          actions: commentActions,
         },
       }).execute();
 
